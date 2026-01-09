@@ -3,33 +3,64 @@
 import { retryer } from "../common/retryer.js";
 import { logger } from "../common/log.js";
 import { excludeRepositories } from "../common/envs.js";
-import { CustomError, MissingParamError } from "../common/error.js";
-import { wrapTextMultiline } from "../common/fmt.js";
+import { MissingParamError } from "../common/error.js";
 import { request } from "../common/http.js";
 
 /**
- * Top languages fetcher object.
+ * Contributions fetcher to get repos from contributionsCollection.
  *
  * @param {any} variables Fetcher variables.
  * @param {string} token GitHub token.
- * @returns {Promise<import("axios").AxiosResponse>} Languages fetcher response.
+ * @returns {Promise<import("axios").AxiosResponse>} Contributions fetcher response.
  */
-const fetcher = (variables, token) => {
+const contributionsFetcher = (variables, token) => {
   return request(
     {
       query: `
-      query userInfo($login: String!) {
+      query userContributions($login: String!, $from: DateTime) {
         user(login: $login) {
-          # fetch only owner repos & not forks
-          repositories(ownerAffiliations: OWNER, isFork: false, first: 100) {
-            nodes {
-              name
-              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
-                edges {
-                  size
-                  node {
-                    color
-                    name
+          contributionsCollection(from: $from) {
+            commitContributionsByRepository(maxRepositories: 100) {
+              repository {
+                name
+                nameWithOwner
+                languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                  edges {
+                    size
+                    node {
+                      color
+                      name
+                    }
+                  }
+                }
+              }
+            }
+            pullRequestContributionsByRepository(maxRepositories: 100) {
+              repository {
+                name
+                nameWithOwner
+                languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                  edges {
+                    size
+                    node {
+                      color
+                      name
+                    }
+                  }
+                }
+              }
+            }
+            issueContributionsByRepository(maxRepositories: 100) {
+              repository {
+                name
+                nameWithOwner
+                languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                  edges {
+                    size
+                    node {
+                      color
+                      name
+                    }
                   }
                 }
               }
@@ -69,45 +100,85 @@ const fetchTopLanguages = async (
     throw new MissingParamError(["username"]);
   }
 
-  const res = await retryer(fetcher, { login: username });
+  // Fetch repos from contributionsCollection across multiple time periods
+  // Query every 6 months for the last 5 years to work around maxRepositories: 100 limit
+  const now = Date.now();
+  const oneYear = 365 * 24 * 60 * 60 * 1000;
+  const sixMonths = oneYear / 2;
+  /** @type {(string | null)[]} */
+  const periods = [null]; // All time first
 
-  if (res.data.errors) {
-    logger.error(res.data.errors);
-    if (res.data.errors[0].type === "NOT_FOUND") {
-      throw new CustomError(
-        res.data.errors[0].message || "Could not fetch user.",
-        CustomError.USER_NOT_FOUND,
-      );
+  for (let years = 0; years < 5; years++) {
+    for (let halfYear = 0; halfYear < 2; halfYear++) {
+      if (years === 0 && halfYear === 0) {
+        continue; // Skip current period
+      }
+      const date = new Date(now - years * oneYear - halfYear * sixMonths);
+      periods.push(date.toISOString());
     }
-    if (res.data.errors[0].message) {
-      throw new CustomError(
-        wrapTextMultiline(res.data.errors[0].message, 90, 1)[0],
-        res.statusText,
-      );
-    }
-    throw new CustomError(
-      "Something went wrong while trying to retrieve the language data using the GraphQL API.",
-      CustomError.GRAPHQL_ERROR,
-    );
   }
 
-  let repoNodes = res.data.data.user.repositories.nodes;
+  const repoMap = new Map();
+
+  // Fetch all periods in parallel for faster execution
+  const fetchPromises = periods.map(async (fromDate) => {
+    try {
+      const variables = { login: username };
+      if (fromDate) {
+        variables.from = fromDate;
+      }
+
+      const res = await retryer(contributionsFetcher, variables);
+
+      if (res.data.errors || !res.data.data?.user?.contributionsCollection) {
+        return [];
+      }
+
+      const contrib = res.data.data.user.contributionsCollection;
+      return [
+        ...contrib.commitContributionsByRepository,
+        ...contrib.pullRequestContributionsByRepository,
+        ...contrib.issueContributionsByRepository,
+      ];
+    } catch (err) {
+      /** @type {any} */
+      const e = err;
+      logger.log(
+        `Failed to fetch contributions for period ${fromDate || "all time"}: ${e.message || e}`,
+      );
+      return [];
+    }
+  });
+
+  // Wait for all requests to complete
+  const allCollections = await Promise.all(fetchPromises);
+
+  // Process all results
+  for (const collections of allCollections) {
+    for (const item of collections) {
+      const repo = item.repository;
+      if (!repo || !repo.languages?.edges?.length) {
+        continue;
+      }
+      const key = repo.nameWithOwner || repo.name;
+      if (key && !repoMap.has(key)) {
+        repoMap.set(key, repo);
+      }
+    }
+  }
+
+  let repoNodes = Array.from(repoMap.values());
   /** @type {Record<string, boolean>} */
   let repoToHide = {};
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
 
-  // populate repoToHide map for quick lookup
-  // while filtering out
-  if (allExcludedRepos) {
-    allExcludedRepos.forEach((repoName) => {
-      repoToHide[repoName] = true;
-    });
-  }
+  // Populate repoToHide map for quick lookup
+  allExcludedRepos.forEach((repoName) => {
+    repoToHide[repoName] = true;
+  });
 
   // filter out repositories to be hidden
-  repoNodes = repoNodes
-    .sort((a, b) => b.size - a.size)
-    .filter((name) => !repoToHide[name.name]);
+  repoNodes = repoNodes.filter((repo) => !repoToHide[repo.name]);
 
   let repoCount = 0;
 
